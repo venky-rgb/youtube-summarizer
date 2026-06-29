@@ -1,191 +1,150 @@
 import streamlit as st
-import subprocess
-import os
-import glob
-import webvtt
-from datetime import datetime
-from ollama import Client  # Official Ollama SDK library
-from pymongo import MongoClient  # MongoDB Python Driver
-import certifi  # Safe SSL verification handling for remote cloud connections
+import yt_dlp
+import requests
+from pymongo import MongoClient
+import re
 
-# --- INITIALIZE PERSISTENT STATE ---
-if "current_summary" not in st.session_state:
-    st.session_state.current_summary = ""
+# ==============================================================================
+# 1. DATABASE & API CONFIGURATION (Streamlit Secrets)
+# ==============================================================================
+# Retrieve MongoDB URI and Ollama Cloud Credentials from Secrets
+MONGO_URI = st.secrets["MONGO_URI"]
+OLLAMA_API_KEY = st.secrets["OLLAMA_API_KEY"]
 
-# --- STREAMLIT NATIVE SECRETS CONFIGURATION ---
-if "OLLAMA_API_KEY" in st.secrets:
-    api_key = st.secrets["OLLAMA_API_KEY"]
-else:
-    api_key = os.environ.get("OLLAMA_API_KEY")
+# Initialize MongoDB Client connection
+client = MongoClient(MONGO_URI)
+db = client['youtube_summarizer_db']  # Database Name
+collection = db['summaries']          # Collection Name
 
-if "MONGO_URI" in st.secrets:
-    MONGO_URI = st.secrets["MONGO_URI"]
-else:
-    MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+# ==============================================================================
+# 2. HELPER FUNCTIONS (Subtitle Fetching & Summarization)
+# ==============================================================================
+def get_clean_video_id(url):
+    """Extracts clean 11-character video ID from any standard YouTube URL link."""
+    pattern = r'(?:v=|\/)([0-9A-Za-z_-]{11}).*'
+    match = re.search(pattern, url)
+    return match.group(1) if match else None
 
-# --- MONGO DATABASE CONFIGURATION ---
-def get_mongo_collection():
-    """Establishes connection and returns the MongoDB collection target."""
-    if "localhost" in MONGO_URI or "127.0.0.1" in MONGO_URI:
-        client = MongoClient(MONGO_URI)
-    else:
-        client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-    db = client["youtube_summarizer_db"]
-    return db["summaries"]
-
-def save_summary_to_mongo(url, summary_text):
-    """Inserts a generated video summary document into MongoDB."""
+def get_youtube_transcript(video_url):
+    """Fetches full text transcripts securely using yt-dlp bypassing IP locks."""
+    ydl_opts = {
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['en'],
+        'quiet': True,
+    }
+    
     try:
-        collection = get_mongo_collection()
-        document = {
-            "video_url": url,
-            "summary": summary_text,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        collection.insert_one(document)
-    except Exception as e:
-        st.error(f"Database write failed: {e}")
-
-def get_past_summaries_from_mongo():
-    """Retrieves all previous summaries from MongoDB sorted by newest first."""
-    try:
-        collection = get_mongo_collection()
-        return list(collection.find().sort("_id", -1))
-    except Exception as e:
-        st.sidebar.error(f"Failed to load database history: {e}")
-        return []
-
-def flush_mongo_database():
-    """Deletes all documents from the summaries collection."""
-    try:
-        collection = get_mongo_collection()
-        collection.delete_many({})
-        return True
-    except Exception as e:
-        st.sidebar.error(f"Failed to clear database: {e}")
-        return False
-
-# --- STREAMLIT GRAPHICAL INTERFACE ---
-st.set_page_config(page_title="AI Video Summarizer", page_icon="📺", layout="wide")
-st.title("📺 Fast & Structured Video Summarizer")
-st.write("Extracts transcripts locally and builds organized notes using Ollama's Cloud API & MongoDB.")
-
-# --- SIDEBAR ENGINE ---
-st.sidebar.header("📜 History (MongoDB Compass)")
-past_records = get_past_summaries_from_mongo()
-
-if past_records:
-    for record in past_records:
-        url = record.get("video_url", "Unknown URL")
-        summary = record.get("summary", "")
-        timestamp = record.get("created_at", "")
-        
-        with st.sidebar.expander(f"🎬 {url[:30]}... ({timestamp})"):
-            st.write(summary)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            subtitles = info.get('subtitles', {}) or info.get('automatic_captions', {})
             
-    st.sidebar.markdown("---")
-    # ADDED: Flush Button targeting database cleaning
-    if st.sidebar.button("🗑️ Flush History Database", type="secondary", use_container_width=True):
-        if flush_mongo_database():
-            st.session_state.current_summary = ""  # Clear active main window display
-            st.sidebar.success("Database Flushed Successfully!")
-            st.rerun()
-else:
-    st.sidebar.info("No past summaries found in MongoDB.")
+            if 'en' in subtitles:
+                # Target the JSON-formatted transcript tracks if available
+                en_subs = subtitles['en']
+                json_track = next((sub for sub in en_subs if sub.get('ext') == 'json'), en_subs[0])
+                sub_url = json_track['url']
+                
+                # Fetch content payload directly from YouTube endpoints
+                response = requests.get(sub_url)
+                if response.status_code == 200:
+                    data = response.json()
+                    # Parse internal string fragments out of nested structures cleanly
+                    text_segments = [
+                        seg['utf8'] 
+                        for event in data.get('events', []) 
+                        for seg in event.get('segs', []) 
+                        if 'utf8' in seg and seg['utf8'].strip()
+                    ]
+                    full_text = " ".join(text_segments)
+                    # Clean up random mid-word formatting bugs
+                    return re.sub(r'\s+', ' ', full_text).strip()
+    except Exception as e:
+        st.sidebar.error(f"Extraction error: {e}")
+    return None
 
-# --- MAIN CONTROLS ENGINE ---
-video_url = st.text_input("Enter YouTube Video URL:", value="")
+def generate_summary_with_ollama(transcript_text):
+    """Sends raw transcripts over to Ollama's Cloud infrastructure API for synthesis."""
+    # Replace with your actual Ollama host cloud endpoint route setup
+    ollama_url = "https://api.ollama.cloud/v1/chat/completions" 
+    
+    headers = {
+        "Authorization": f"Bearer {OLLAMA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "llama3", # Or whichever active base model your script uses
+        "messages": [
+            {"role": "system", "content": "Provide an organized, clear summary of this video transcript using clean bullet points."},
+            {"role": "user", "content": transcript_text}
+        ],
+        "stream": False
+    }
+    
+    try:
+        res = requests.post(ollama_url, json=payload, headers=headers)
+        if res.status_code == 200:
+            return res.json()['choices'][0]['message']['content']
+    except Exception as e:
+        return f"Summarization Error: {e}"
+    return "Failed to process text using Ollama cloud resources."
 
-def clean_up_files():
-    """Wipes out cached sub tracks from storage to stay space-efficient."""
-    for f in glob.glob("temp_sub*"):
-        try: os.remove(f)
-        except: pass
+# ==============================================================================
+# 3. USER INTERFACE (Streamlit Front-End)
+# ==============================================================================
+st.set_page_config(page_title="Fast & Structured Video Summarizer", page_icon="📺", layout="wide")
+
+# Sidebar - Fetch and show past entries from MongoDB Atlas
+st.sidebar.title("📝 History (MongoDB)")
+try:
+    past_summaries = list(collection.find().sort("_id", -1))
+    if past_summaries:
+        for item in past_summaries:
+            with st.sidebar.expander(item.get('title', 'Saved Summary')):
+                st.write(item.get('summary'))
+    else:
+        st.sidebar.info("No past summaries found in MongoDB.")
+except Exception as mongo_err:
+    st.sidebar.error(f"Database sync issue: {mongo_err}")
+
+# Main Window Form Layout
+st.title("📺 Fast & Structured Video Summarizer")
+st.caption("Extracts transcripts cleanly using yt-dlp and builds organized notes using Ollama & MongoDB.")
+
+video_input = st.text_input("Enter YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
 
 if st.button("Summarize Video", type="primary"):
-    if not api_key:
-        st.error("Missing Ollama Cloud API Key! Please verify your configuration in '.streamlit/secrets.toml'.")
-    elif video_url.strip():
-        clean_up_files()
-        st.session_state.current_summary = ""  
-        
-        with st.spinner("Step 1: Extracting timeline transcript tracks..."):
-            command = [
-                "yt-dlp", "--skip-download", "--write-auto-subs", "--write-subs",
-                "--sub-lang", "en", "--output", "temp_sub", video_url
-            ]
-            subprocess.run(command, capture_output=True, text=True)
-            
-            sub_files = glob.glob("temp_sub.en.*")
-            full_transcript = ""
-            
-            if sub_files and os.path.exists(sub_files[0]):
-                try:
-                    vtt = webvtt.read(sub_files[0])
-                    cleaned_lines = []
-                    
-                    for caption in vtt:
-                        text = caption.text.strip().replace('\n', ' ')
-                        if text:
-                            if cleaned_lines and text.startswith(cleaned_lines[-1]):
-                                cleaned_lines[-1] = text
-                            elif cleaned_lines and cleaned_lines[-1].startswith(text):
-                                continue
-                            else:
-                                cleaned_lines.append(text)
-                                
-                    full_transcript = " ".join(cleaned_lines)
-                except Exception as e:
-                    st.error(f"Parsing error: {e}")
-            else:
-                st.error("No subtitles found. Please verify the video has English audio/captions.")
-
-        if full_transcript:
-            st.subheader("📋 Organized Video Breakdown:")
-            output_container = st.empty()
-            live_text = ""
-            
-            try:
-                cloud_client = Client(
-                    host="https://ollama.com",
-                    headers={"Authorization": f"Bearer {api_key}"}
-                )
-                
-                prompt_structure = (
-                    "You are a technical note-taking assistant. Summarize the transcript below into an organized structure. "
-                    "CRITICAL FORMATTING RULE: For side headings, do NOT use bold bullet points. Instead, use bold text prefixed with '🔹 ' (e.g., 🔹 **High-level nature:**). "
-                    "List the details belonging to that heading directly underneath it using indented bullet points.\n\n"
-                    f"Transcript:\n{full_transcript[:6000]}"
-                )
-                
-                response_stream = cloud_client.chat(
-                    model="gpt-oss:120b",
-                    messages=[{"role": "user", "content": prompt_structure}],
-                    stream=True
-                )
-                
-                for chunk in response_stream:
-                    token = chunk['message']['content']
-                    if token:
-                        live_text += token
-                        output_container.write(live_text)
-                    
-                if live_text.strip():
-                    save_summary_to_mongo(video_url, live_text)
-                    st.session_state.current_summary = live_text
-                    st.success("Notes Generated & Saved to MongoDB Compass!")
-                    st.rerun()  
-                else:
-                    st.error("The model responded with empty content. Please verify your token state on ollama.com.")
-                
-            except Exception as e:
-                st.error(f"Ollama Cloud interaction failed: {e}")
-                    
-        clean_up_files()
+    if not video_input.strip():
+        st.warning("Please enter a valid link first.")
     else:
-        st.warning("Please paste a link first!")
-
-# --- DISPLAY PERSISTED RESULTS ENGINE ---
-if st.session_state.current_summary:
-    st.subheader("📋 Active Video Notes:")
-    st.markdown(st.session_state.current_summary)
+        video_id = get_clean_video_id(video_input)
+        if not video_id:
+            st.error("Invalid YouTube link format.")
+        else:
+            with st.spinner("Extracting dialogue tracks from video processing engines..."):
+                transcript = get_youtube_transcript(video_input)
+                
+            if not transcript:
+                st.error("No subtitles found. Please verify the video has English audio/captions.")
+            else:
+                with st.spinner("Ollama is synthesizing notes structure..."):
+                    summary_result = generate_summary_with_ollama(transcript)
+                    
+                st.success("Summary Completed!")
+                st.markdown("### 📋 Executive Summary")
+                st.write(summary_result)
+                
+                # Automatically save the clean workspace snapshot up into your database
+                try:
+                    collection.insert_one({
+                        "video_id": video_id,
+                        "title": f"Video Summary ({video_id})",
+                        "summary": summary_result,
+                        "transcript_preview": transcript[:200] + "..."
+                    })
+                    st.toast("Summary saved safely to MongoDB Atlas!")
+                    st.rerun() # Refresh layout smoothly to reflect new history index element
+                except Exception as save_err:
+                    st.error(f"Failed to record data object into Atlas cloud: {save_err}")
